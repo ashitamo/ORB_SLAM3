@@ -41,6 +41,7 @@
 
 #include <mutex>
 #include <unordered_set>
+#include <atomic>
 
 namespace ORB_SLAM3
 {
@@ -55,7 +56,8 @@ class Settings;
 
 class Tracking
 {  
-
+private:
+    bool mbAtlasLoaded = false;
 public:
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
     Tracking(System* pSys, ORBVocabulary* pVoc, FrameDrawer* pFrameDrawer, MapDrawer* pMapDrawer, Atlas* pAtlas,
@@ -107,6 +109,52 @@ public:
     void SaveSubTrajectory(string strNameFile_frames, string strNameFile_kf, Map* pMap);
 
     float GetImageScale();
+
+    void SetAtlasLoaded(bool loaded)
+    {
+        mbAtlasLoaded = loaded;
+    }
+    bool mbRelocalizedFromLoadedAtlas = false;
+
+    // 已完成 Atlas 視覺重定位，但還沒有建立本次 session 的 live IMU anchor。
+    bool mbAtlasWaitingLiveAnchor = false;
+
+    // 本次 session 的第一個 live KeyFrame 已建立。
+    bool mbAtlasLiveAnchorReady = false;
+
+    // 本次 session 的 live anchor KeyFrame。
+    KeyFrame* mpAtlasLiveAnchorKF = nullptr;
+
+    // ============================================================
+    // Loaded-Atlas new-session static IMU initialization
+    // ============================================================
+
+    // 是否正在收集本次 session 的靜止 IMU。
+    bool mbAtlasCollectingStaticImu = false;
+
+    // 是否已收集到足夠且判定為靜止的 IMU。
+    bool mbAtlasStaticImuReady = false;
+
+    // IMU 統計資料。
+    int mnAtlasStaticImuSamples = 0;
+
+    double mAtlasStaticImuStartTime = -1.0;
+    double mAtlasStaticImuLastTime = -1.0;
+
+    Eigen::Vector3f mAtlasGyroSum = Eigen::Vector3f::Zero();
+    Eigen::Vector3f mAtlasGyroSqSum = Eigen::Vector3f::Zero();
+
+    Eigen::Vector3f mAtlasAccSum = Eigen::Vector3f::Zero();
+    Eigen::Vector3f mAtlasAccSqSum = Eigen::Vector3f::Zero();
+
+    Eigen::Vector3f mAtlasGyroMean = Eigen::Vector3f::Zero();
+    Eigen::Vector3f mAtlasGyroStd = Eigen::Vector3f::Zero();
+
+    Eigen::Vector3f mAtlasAccMean = Eigen::Vector3f::Zero();
+    Eigen::Vector3f mAtlasAccStd = Eigen::Vector3f::Zero();
+
+    void UpdateAtlasStaticImuStatistics(
+        const std::vector<IMU::Point>& vImuMeasurements);
 
 #ifdef REGISTER_LOOP
     void RequestStop();
@@ -241,6 +289,7 @@ protected:
     std::vector<IMU::Point> mvImuFromLastFrame;
     std::mutex mMutexImuQueue;
 
+    std::atomic<float> mLatestGyroNorm{-1.0f};
     // Imu calibration parameters
     IMU::Calib *mpImuCalib;
 

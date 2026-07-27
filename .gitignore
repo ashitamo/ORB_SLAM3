@@ -91,3 +91,11 @@ my_settings.txt
 borrar/*
 
 */ExecMean.txt
+.vscode/
+src/.vscode/
+install/
+log/
+*.backup
+*.bak
+*.before_*
+Examples/Stereo-Inertial/D405_stereo_inertial_before_Tbc_fix.yaml

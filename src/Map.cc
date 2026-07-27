@@ -359,23 +359,54 @@ void Map::SetLastMapChange(int currentChangeId)
 void Map::PreSave(std::set<GeometricCamera*> &spCams)
 {
     int nMPWithoutObs = 0;
-    for(MapPoint* pMPi : mspMapPoints)
+
+    /*
+    * EraseObservation() 可能間接呼叫 SetBadFlag()，
+    * 而 SetBadFlag() 會從 mspMapPoints 移除目前 MapPoint。
+    *
+    * 因此不能直接遍歷 mspMapPoints 並在迴圈中呼叫
+    * EraseObservation()，否則 std::set iterator 可能失效。
+    */
+    const std::vector<MapPoint*> vpMapPointsSnapshot(
+        mspMapPoints.begin(),
+        mspMapPoints.end());
+
+    for(MapPoint* pMPi : vpMapPointsSnapshot)
     {
         if(!pMPi || pMPi->isBad())
             continue;
 
-        if(pMPi->GetObservations().size() == 0)
+        const map<KeyFrame*, std::tuple<int,int>> mpObs =
+            pMPi->GetObservations();
+
+        if(mpObs.empty())
         {
             nMPWithoutObs++;
         }
-        map<KeyFrame*, std::tuple<int,int>> mpObs = pMPi->GetObservations();
-        for(map<KeyFrame*, std::tuple<int,int>>::iterator it= mpObs.begin(), end=mpObs.end(); it!=end; ++it)
+
+        for(const auto& obs : mpObs)
         {
-            if(it->first->GetMap() != this || it->first->isBad())
+            KeyFrame* pObsKF = obs.first;
+
+            if(!pObsKF ||
+            pObsKF->GetMap() != this ||
+            pObsKF->isBad())
             {
-                pMPi->EraseObservation(it->first);
+                if(pObsKF)
+                {
+                    pMPi->EraseObservation(pObsKF);
+                }
             }
 
+            /*
+            * EraseObservation() 後，這個 MapPoint 可能已經
+            * 被 SetBadFlag() 標成 bad 並從 Map 移除。
+            * 此時不要繼續處理它的其他 observation。
+            */
+            if(pMPi->isBad())
+            {
+                break;
+            }
         }
     }
 
@@ -390,15 +421,26 @@ void Map::PreSave(std::set<GeometricCamera*> &spCams)
 
     // Backup of MapPoints
     mvpBackupMapPoints.clear();
-    for(MapPoint* pMPi : mspMapPoints)
+
+    const std::vector<MapPoint*> vpValidMapPointsSnapshot(
+        mspMapPoints.begin(),
+        mspMapPoints.end());
+
+    for(MapPoint* pMPi : vpValidMapPointsSnapshot)
     {
         if(!pMPi || pMPi->isBad())
             continue;
 
-        mvpBackupMapPoints.push_back(pMPi);
-        pMPi->PreSave(mspKeyFrames,mspMapPoints);
-    }
+        /*
+        * 前面的 cleanup 可能已經把它從 mspMapPoints 移除，
+        * 因此再確認一次 membership。
+        */
+        if(mspMapPoints.find(pMPi) == mspMapPoints.end())
+            continue;
 
+        mvpBackupMapPoints.push_back(pMPi);
+        pMPi->PreSave(mspKeyFrames, mspMapPoints);
+    }
     // Backup of KeyFrames
     mvpBackupKeyFrames.clear();
     for(KeyFrame* pKFi : mspKeyFrames)
@@ -421,7 +463,13 @@ void Map::PreSave(std::set<GeometricCamera*> &spCams)
     {
         mnBackupKFlowerID = mpKFlowerID->mnId;
     }
-
+    std::cout
+        << "[MAP PRESAVE] map=" << GetId()
+        << " source_KFs=" << mspKeyFrames.size()
+        << " source_MPs=" << mspMapPoints.size()
+        << " backup_KFs=" << mvpBackupKeyFrames.size()
+        << " backup_MPs=" << mvpBackupMapPoints.size()
+        << std::endl;
 }
 
 void Map::PostLoad(KeyFrameDatabase* pKFDB, ORBVocabulary* pORBVoc/*, map<long unsigned int, KeyFrame*>& mpKeyFrameId*/, map<unsigned int, GeometricCamera*> &mpCams)

@@ -30,12 +30,17 @@
 #include "GeometricTools.h"
 
 #include <iostream>
-
 #include <mutex>
 #include <chrono>
-
+#include <iomanip>
 
 using namespace std;
+
+namespace
+{
+constexpr bool kEnableImuPrediction = true;
+constexpr bool kEnableInertialOptimization = true;
+}
 
 namespace ORB_SLAM3
 {
@@ -46,7 +51,7 @@ Tracking::Tracking(System *pSys, ORBVocabulary* pVoc, FrameDrawer *pFrameDrawer,
     mbOnlyTracking(false), mbMapUpdated(false), mbVO(false), mpORBVocabulary(pVoc), mpKeyFrameDB(pKFDB),
     mbReadyToInitializate(false), mpSystem(pSys), mpViewer(NULL), bStepByStep(false),
     mpFrameDrawer(pFrameDrawer), mpMapDrawer(pMapDrawer), mpAtlas(pAtlas), mnLastRelocFrameId(0), time_recently_lost(5.0),
-    mnInitialFrameId(0), mbCreatedMap(false), mnFirstFrameId(0), mpCamera2(nullptr), mpLastKeyFrame(static_cast<KeyFrame*>(NULL))
+    mnInitialFrameId(0), mbCreatedMap(false), mnFirstFrameId(0), mpCamera2(nullptr), mpReferenceKF(static_cast<KeyFrame*>(NULL)), mpLastKeyFrame(static_cast<KeyFrame*>(NULL))
 {
     // Load camera parameters from settings file
     if(settings){
@@ -583,7 +588,18 @@ void Tracking::newParameterLoader(Settings *settings) {
 
     mMinFrames = 0;
     mMaxFrames = settings->fps();
+
+    // IMU relocalization 後，在這段 frame window 內只做 visual pose optimization，
+    // 等待新的 IMU preintegration chain 建立完成。
+    mnFramesToResetIMU = mMaxFrames;
+
     mbRGB = settings->rgb();
+
+    std::cout
+        << "[TRACKING CONFIG]"
+        << " mMaxFrames=" << mMaxFrames
+        << " mnFramesToResetIMU=" << mnFramesToResetIMU
+        << std::endl;
 
     //ORB parameters
     int nFeatures = settings->nFeatures();
@@ -604,7 +620,13 @@ void Tracking::newParameterLoader(Settings *settings) {
     Sophus::SE3f Tbc = settings->Tbc();
     mInsertKFsLost = settings->insertKFsWhenLost();
     mImuFreq = settings->imuFrequency();
-    mImuPer = 0.001; //1.0 / (double) mImuFreq;     //TODO: ESTO ESTA BIEN?
+    // mImuPer = 0.001; //1.0 / (double) mImuFreq;     //TODO: ESTO ESTA BIEN?
+    mImuPer = 1.0 / static_cast<double>(mImuFreq);
+    std::cout
+        << "[IMU CONFIG]"
+        << " frequency=" << mImuFreq
+        << " period=" << mImuPer
+        << std::endl;
     float Ng = settings->noiseGyro();
     float Na = settings->noiseAcc();
     float Ngw = settings->gyroWalk();
@@ -1614,11 +1636,205 @@ Sophus::SE3f Tracking::GrabImageMonocular(const cv::Mat &im, const double &times
     return mCurrentFrame.GetPose();
 }
 
-
-void Tracking::GrabImuData(const IMU::Point &imuMeasurement)
+void Tracking::UpdateAtlasStaticImuStatistics(
+    const std::vector<IMU::Point>& vImuMeasurements)
 {
+    if(!mbAtlasCollectingStaticImu ||
+       mbAtlasStaticImuReady ||
+       vImuMeasurements.empty())
+    {
+        return;
+    }
+
+    for(const IMU::Point& imuMeasurement : vImuMeasurements)
+    {
+        /*
+         * 避免 PreintegrateIMU() 相鄰 frame 之間重複包含
+         * 邊界 IMU sample。
+         */
+        if(mAtlasStaticImuLastTime >= 0.0 &&
+           imuMeasurement.t <= mAtlasStaticImuLastTime)
+        {
+            continue;
+        }
+
+        if(mAtlasStaticImuStartTime < 0.0)
+        {
+            mAtlasStaticImuStartTime =
+                imuMeasurement.t;
+        }
+
+        mAtlasStaticImuLastTime =
+            imuMeasurement.t;
+
+        const Eigen::Vector3f& gyro =
+            imuMeasurement.w;
+
+        const Eigen::Vector3f& acc =
+            imuMeasurement.a;
+
+        mAtlasGyroSum += gyro;
+        mAtlasGyroSqSum +=
+            gyro.cwiseProduct(gyro);
+
+        mAtlasAccSum += acc;
+        mAtlasAccSqSum +=
+            acc.cwiseProduct(acc);
+
+        ++mnAtlasStaticImuSamples;
+    }
+
+    if(mAtlasStaticImuStartTime < 0.0 ||
+       mAtlasStaticImuLastTime < 0.0)
+    {
+        return;
+    }
+
+    const double duration =
+        mAtlasStaticImuLastTime -
+        mAtlasStaticImuStartTime;
+
+    if(mnAtlasStaticImuSamples < 200 ||
+       duration < 1.8)
+    {
+        return;
+    }
+
+    const float invN =
+        1.0f /
+        static_cast<float>(
+            mnAtlasStaticImuSamples);
+
+    mAtlasGyroMean =
+        mAtlasGyroSum * invN;
+
+    mAtlasAccMean =
+        mAtlasAccSum * invN;
+
+    Eigen::Vector3f gyroVariance =
+        mAtlasGyroSqSum * invN -
+        mAtlasGyroMean.cwiseProduct(
+            mAtlasGyroMean);
+
+    Eigen::Vector3f accVariance =
+        mAtlasAccSqSum * invN -
+        mAtlasAccMean.cwiseProduct(
+            mAtlasAccMean);
+
+    gyroVariance =
+        gyroVariance.cwiseMax(
+            Eigen::Vector3f::Zero());
+
+    accVariance =
+        accVariance.cwiseMax(
+            Eigen::Vector3f::Zero());
+
+    mAtlasGyroStd =
+        gyroVariance.cwiseSqrt();
+
+    mAtlasAccStd =
+        accVariance.cwiseSqrt();
+
+    const float gyroStdNorm =
+        mAtlasGyroStd.norm();
+
+    const float accStdNorm =
+        mAtlasAccStd.norm();
+
+    const float accMeanNorm =
+        mAtlasAccMean.norm();
+
+    const bool gyroStatic =
+        gyroStdNorm < 0.01f;
+
+    const bool accStatic =
+        accStdNorm < 0.15f;
+
+    const bool gravityReasonable =
+        accMeanNorm > 8.5f &&
+        accMeanNorm < 11.0f;
+
+    std::cout
+        << std::fixed
+        << std::setprecision(8)
+        << "[ATLAS STATIC IMU]"
+        << " samples="
+        << mnAtlasStaticImuSamples
+        << " duration="
+        << duration
+        << " gyroMean=["
+        << mAtlasGyroMean.transpose()
+        << "]"
+        << " gyroStd=["
+        << mAtlasGyroStd.transpose()
+        << "]"
+        << " gyroStdNorm="
+        << gyroStdNorm
+        << " accMean=["
+        << mAtlasAccMean.transpose()
+        << "]"
+        << " accNorm="
+        << accMeanNorm
+        << " accStd=["
+        << mAtlasAccStd.transpose()
+        << "]"
+        << " accStdNorm="
+        << accStdNorm
+        << std::endl;
+
+    if(gyroStatic &&
+       accStatic &&
+       gravityReasonable)
+    {
+        mbAtlasStaticImuReady = true;
+        mbAtlasCollectingStaticImu = false;
+
+        std::cout
+            << "[ATLAS STATIC IMU] READY"
+            << " gyroBias=["
+            << mAtlasGyroMean.transpose()
+            << "]"
+            << std::endl;
+
+        return;
+    }
+
+    std::cout
+        << "[ATLAS STATIC IMU] REJECTED"
+        << " gyroStatic="
+        << gyroStatic
+        << " accStatic="
+        << accStatic
+        << " gravityReasonable="
+        << gravityReasonable
+        << std::endl;
+
+    /*
+     * 重設後，重新收集下一個完整時間窗口。
+     */
+    mnAtlasStaticImuSamples = 0;
+
+    mAtlasStaticImuStartTime = -1.0;
+    mAtlasStaticImuLastTime = -1.0;
+
+    mAtlasGyroSum.setZero();
+    mAtlasGyroSqSum.setZero();
+
+    mAtlasAccSum.setZero();
+    mAtlasAccSqSum.setZero();
+}
+
+void Tracking::GrabImuData(
+    const IMU::Point &imuMeasurement)
+{
+    mLatestGyroNorm.store(
+        imuMeasurement.w.norm(),
+        std::memory_order_relaxed);
+
     unique_lock<mutex> lock(mMutexImuQueue);
-    mlQueueImuData.push_back(imuMeasurement);
+
+    mlQueueImuData.push_back(
+        imuMeasurement);
 }
 
 void Tracking::PreintegrateIMU()
@@ -1632,17 +1848,28 @@ void Tracking::PreintegrateIMU()
     }
 
     mvImuFromLastFrame.clear();
-    mvImuFromLastFrame.reserve(mlQueueImuData.size());
-    if(mlQueueImuData.size() == 0)
+    /*
+    * 只在 mutex 保護下讀取 queue 狀態。
+    */
     {
-        Verbose::PrintMess("Not IMU data in mlQueueImuData!!", Verbose::VERBOSITY_NORMAL);
-        mCurrentFrame.setIntegrated();
-        return;
+        unique_lock<mutex> lock(mMutexImuQueue);
+
+        if(mlQueueImuData.empty())
+        {
+            Verbose::PrintMess(
+                "Not IMU data in mlQueueImuData!!",
+                Verbose::VERBOSITY_NORMAL);
+
+            mCurrentFrame.setIntegrated();
+            return;
+        }
+
+        mvImuFromLastFrame.reserve(
+            mlQueueImuData.size());
     }
 
     while(true)
     {
-        bool bSleep = false;
         {
             unique_lock<mutex> lock(mMutexImuQueue);
             if(!mlQueueImuData.empty())
@@ -1667,18 +1894,26 @@ void Tracking::PreintegrateIMU()
             else
             {
                 break;
-                bSleep = true;
             }
         }
-        if(bSleep)
-            usleep(500);
     }
 
-    const int n = mvImuFromLastFrame.size()-1;
-    if(n==0){
-        cout << "Empty IMU measurements vector!!!\n";
+    UpdateAtlasStaticImuStatistics(mvImuFromLastFrame);
+
+    if(mvImuFromLastFrame.size() < 2)
+    {
+        std::cout
+            << "[IMU PREINTEGRATION] Insufficient measurements"
+            << " count=" << mvImuFromLastFrame.size()
+            << std::endl;
+
+        mCurrentFrame.setIntegrated();
         return;
     }
+
+const int n =
+    static_cast<int>(
+        mvImuFromLastFrame.size()) - 1;
 
     IMU::Preintegrated* pImuPreintegratedFromLastFrame = new IMU::Preintegrated(mLastFrame.mImuBias,mCurrentFrame.mImuCalib);
 
@@ -1859,9 +2094,21 @@ void Tracking::Track()
     if ((mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD) && mpLastKeyFrame)
         mCurrentFrame.SetNewBias(mpLastKeyFrame->GetImuBias());
 
-    if(mState==NO_IMAGES_YET)
+    if(mState == NO_IMAGES_YET)
     {
-        mState = NOT_INITIALIZED;
+        if(mbAtlasLoaded)
+        {
+            mState = LOST;
+
+            std::cout
+                << "[TRACK] Atlas loaded, "
+                << "starting relocalization"
+                << std::endl;
+        }
+        else
+        {
+            mState = NOT_INITIALIZED;
+        }
     }
 
     mLastProcessedState=mState;
@@ -1986,9 +2233,29 @@ void Tracking::Track()
                     if((mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD))
                     {
                         if(pCurrentMap->isImuInitialized())
-                            PredictStateIMU();
+                        {
+                            if(kEnableImuPrediction)
+                            {
+                                bOK = PredictStateIMU();
+                            }
+                            else
+                            {
+                                /*
+                                * 此測試禁止 RECENTLY_LOST 狀態使用 IMU prediction。
+                                * 不應假裝 prediction 成功。
+                                */
+                                bOK = false;
+
+                                std::cout
+                                    << "[IMU TEST] PredictStateIMU disabled in RECENTLY_LOST"
+                                    << " frame=" << mCurrentFrame.mnId
+                                    << std::endl;
+                            }
+                        }
                         else
+                        {
                             bOK = false;
+                        }
 
                         if (mCurrentFrame.mTimeStamp-mTimeStampLost>time_recently_lost)
                         {
@@ -2013,22 +2280,107 @@ void Tracking::Track()
                 }
                 else if (mState == LOST)
                 {
-
-                    Verbose::PrintMess("A new map is started...", Verbose::VERBOSITY_NORMAL);
-
-                    if (pCurrentMap->KeyFramesInMap()<10)
+                    if(mbAtlasLoaded)
                     {
-                        mpSystem->ResetActiveMap();
-                        Verbose::PrintMess("Reseting current map...", Verbose::VERBOSITY_NORMAL);
-                    }else
-                        CreateMapInAtlas();
+                        std::cout
+                            << "[ATLAS RELOCALIZATION] Attempting"
+                            << " frame=" << mCurrentFrame.mnId
+                            << " map=" << pCurrentMap->GetId()
+                            << " KFs=" << pCurrentMap->KeyFramesInMap()
+                            << " MPs=" << pCurrentMap->MapPointsInMap()
+                            << std::endl;
 
-                    if(mpLastKeyFrame)
-                        mpLastKeyFrame = static_cast<KeyFrame*>(NULL);
+                        bOK = Relocalization();
 
-                    Verbose::PrintMess("done", Verbose::VERBOSITY_NORMAL);
+                        if(bOK)
+                        {
+                            mState = OK;
+                            mbAtlasLoaded = false;
+                            mbRelocalizedFromLoadedAtlas = true;
 
-                    return;
+                            mbVelocity = false;
+                            mbVO = false;
+
+                            // 再次明確記錄啟動重定位幀
+                            mnLastRelocFrameId = mCurrentFrame.mnId;
+
+                            std::cout
+                                << "[ATLAS RELOCALIZATION] Before frame copy"
+                                << " currentFrame=" << mCurrentFrame.mnId
+                                << " lastReloc=" << mnLastRelocFrameId
+                                << std::endl;
+
+                            mLastFrame = Frame(mCurrentFrame);
+
+                            // 防止 Frame copy 或其他流程意外改動
+                            mnLastRelocFrameId = mCurrentFrame.mnId;
+
+                            std::cout
+                                << "[ATLAS RELOCALIZATION] After frame copy"
+                                << " currentFrame=" << mCurrentFrame.mnId
+                                << " lastReloc=" << mnLastRelocFrameId
+                                << std::endl;
+
+                            std::cout
+                                << "[ATLAS RELOCALIZATION] SUCCESS"
+                                << " frame=" << mCurrentFrame.mnId
+                                << " map=" << pCurrentMap->GetId()
+                                << " lastReloc=" << mnLastRelocFrameId
+                                << std::endl;
+
+                            std::cout
+                                << "[ATLAS RELOCALIZATION] Startup frame committed; "
+                                << "continue tracking from next frame"
+                                << std::endl;
+
+                            mpFrameDrawer->Update(this);
+                            return;
+                        }
+                        else
+                        {
+                            std::cout
+                                << "[ATLAS RELOCALIZATION] FAILED"
+                                << " frame=" << mCurrentFrame.mnId
+                                << std::endl;
+
+                            mState = LOST;
+                            mLastFrame = Frame(mCurrentFrame);
+
+                            // 下一幀繼續嘗試，不建立新地圖
+                            return;
+                        }
+                    }
+                    else
+                    {
+                        Verbose::PrintMess(
+                            "A new map is started...",
+                            Verbose::VERBOSITY_NORMAL);
+
+                        if(pCurrentMap->KeyFramesInMap() < 10)
+                        {
+                            mpSystem->ResetActiveMap();
+
+                            Verbose::PrintMess(
+                                "Reseting current map...",
+                                Verbose::VERBOSITY_NORMAL);
+                        }
+                        else
+                        {
+                            CreateMapInAtlas();
+                        }
+
+                        if(mpLastKeyFrame)
+                        {
+                            mpLastKeyFrame =
+                                static_cast<KeyFrame*>(NULL);
+                        }
+
+                        Verbose::PrintMess(
+                            "done",
+                            Verbose::VERBOSITY_NORMAL);
+
+                        return;
+                    }
                 }
             }
 
@@ -2164,29 +2516,47 @@ void Tracking::Track()
         }
 
         // Save frame if recent relocalization, since they are used for IMU reset (as we are making copy, it shluld be once mCurrFrame is completely modified)
-        if((mCurrentFrame.mnId<(mnLastRelocFrameId+mnFramesToResetIMU)) && (mCurrentFrame.mnId > mnFramesToResetIMU) &&
-           (mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD) && pCurrentMap->isImuInitialized())
+        if(!mbRelocalizedFromLoadedAtlas &&
+        (mCurrentFrame.mnId <
+            (mnLastRelocFrameId + mnFramesToResetIMU)) &&
+        (mCurrentFrame.mnId >static_cast<unsigned long>(mnFramesToResetIMU)) &&
+        (mSensor == System::IMU_MONOCULAR ||
+            mSensor == System::IMU_STEREO ||
+            mSensor == System::IMU_RGBD) &&
+        pCurrentMap->isImuInitialized() &&
+        mCurrentFrame.mpImuPreintegratedFrame)
         {
-            // TODO check this situation
-            Verbose::PrintMess("Saving pointer to frame. imu needs reset...", Verbose::VERBOSITY_NORMAL);
             Frame* pF = new Frame(mCurrentFrame);
             pF->mpPrevFrame = new Frame(mLastFrame);
 
-            // Load preintegration
-            pF->mpImuPreintegratedFrame = new IMU::Preintegrated(mCurrentFrame.mpImuPreintegratedFrame);
+            pF->mpImuPreintegratedFrame =
+                new IMU::Preintegrated(
+                    mCurrentFrame.mpImuPreintegratedFrame);
         }
 
         if(pCurrentMap->isImuInitialized())
         {
             if(bOK)
             {
-                if(mCurrentFrame.mnId==(mnLastRelocFrameId+mnFramesToResetIMU))
+                if(mbRelocalizedFromLoadedAtlas)
+                {
+                    std::cout
+                        << "[ATLAS RELOCALIZATION] Skip ResetFrameIMU "
+                        << "for startup relocalization"
+                        << std::endl;
+
+                }
+                else if(mCurrentFrame.mnId ==
+                        (mnLastRelocFrameId + mnFramesToResetIMU))
                 {
                     cout << "RESETING FRAME!!!" << endl;
                     ResetFrameIMU();
                 }
-                else if(mCurrentFrame.mnId>(mnLastRelocFrameId+30))
+                else if(mCurrentFrame.mnId >
+                        (mnLastRelocFrameId + 30))
+                {
                     mLastBias = mCurrentFrame.mImuBias;
+                }
             }
         }
 
@@ -2334,27 +2704,105 @@ void Tracking::Track()
 
 void Tracking::StereoInitialization()
 {
-    if(mCurrentFrame.N>500)
+    if(mCurrentFrame.N > 500)
     {
-        if (mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD)
+        if (mSensor == System::IMU_STEREO ||
+            mSensor == System::IMU_RGBD)
         {
-            if (!mCurrentFrame.mpImuPreintegrated || !mLastFrame.mpImuPreintegrated)
+            if (!mCurrentFrame.mpImuPreintegrated ||
+                !mLastFrame.mpImuPreintegrated)
             {
                 cout << "not IMU meas" << endl;
                 return;
             }
 
-            if (!mFastInit && (mCurrentFrame.mpImuPreintegratedFrame->avgA-mLastFrame.mpImuPreintegratedFrame->avgA).norm()<0.5)
+            if (!mFastInit)
             {
-                cout << "not enough acceleration" << endl;
-                return;
+                if (!mCurrentFrame.mpImuPreintegratedFrame ||
+                    !mLastFrame.mpImuPreintegratedFrame)
+                {
+                    cout << "[STEREO INIT] Invalid IMU preintegration frame pointer"
+                         << " current="
+                         << mCurrentFrame.mpImuPreintegratedFrame
+                         << " last="
+                         << mLastFrame.mpImuPreintegratedFrame
+                         << endl;
+                    return;
+                }
+
+                const Eigen::Vector3f avgA_current =
+                    mCurrentFrame.mpImuPreintegratedFrame->avgA;
+
+                const Eigen::Vector3f avgA_last =
+                    mLastFrame.mpImuPreintegratedFrame->avgA;
+
+                // 先檢查有限值，再計算 norm。
+                if (!avgA_current.allFinite() ||
+                    !avgA_last.allFinite())
+                {
+                    cout << "[STEREO INIT] Non-finite average acceleration"
+                         << " current=" << avgA_current.transpose()
+                         << " last=" << avgA_last.transpose()
+                         << endl;
+                    return;
+                }
+
+                const float currentNorm = avgA_current.norm();
+                const float lastNorm = avgA_last.norm();
+
+                constexpr float maxReasonableAvgAcceleration = 100.0f;
+
+                if (currentNorm > maxReasonableAvgAcceleration ||
+                    lastNorm > maxReasonableAvgAcceleration)
+                {
+                    cout << "[STEREO INIT] Unreasonable average acceleration"
+                         << " current=" << avgA_current.transpose()
+                         << " current_norm=" << currentNorm
+                         << " last=" << avgA_last.transpose()
+                         << " last_norm=" << lastNorm
+                         << endl;
+                    return;
+                }
+
+                const float accExcitation =
+                    (avgA_current - avgA_last).norm();
+
+                cout << "[STEREO INIT]"
+                     << " avgA_current=" << avgA_current.transpose()
+                     << " avgA_last=" << avgA_last.transpose()
+                     << " diff_norm=" << accExcitation
+                     << endl;
+
+                if (!std::isfinite(accExcitation))
+                {
+                    cout << "[STEREO INIT] Invalid acceleration difference"
+                         << endl;
+                    return;
+                }
+
+                // 保留 ORB-SLAM3 原本的 0.5 門檻。
+                if (accExcitation < 0.5f)
+                {
+                    cout << "not enough acceleration"
+                         << " diff_norm=" << accExcitation
+                         << " threshold=0.5"
+                         << endl;
+                    return;
+                }
             }
 
             if(mpImuPreintegratedFromLastKF)
+            {
                 delete mpImuPreintegratedFromLastKF;
+            }
 
-            mpImuPreintegratedFromLastKF = new IMU::Preintegrated(IMU::Bias(),*mpImuCalib);
-            mCurrentFrame.mpImuPreintegrated = mpImuPreintegratedFromLastKF;
+            mpImuPreintegratedFromLastKF =
+                new IMU::Preintegrated(
+                    IMU::Bias(),
+                    *mpImuCalib);
+
+            mCurrentFrame.mpImuPreintegrated =
+                mpImuPreintegratedFromLastKF;
         }
 
         // Set Frame pose to the origin (In case of inertial SLAM to imu)
@@ -2719,6 +3167,22 @@ void Tracking::CheckReplacedInLastFrame()
 
 bool Tracking::TrackReferenceKeyFrame()
 {
+    if(!mpReferenceKF)
+    {
+        std::cerr
+            << "[TRACK_REF_KF] ERROR: mpReferenceKF is null"
+            << std::endl;
+        return false;
+    }
+
+    if(mpReferenceKF->GetMap() != mpAtlas->GetCurrentMap())
+    {
+        std::cerr
+            << "[TRACK_REF_KF] ERROR: reference KF belongs to wrong map"
+            << std::endl;
+        return false;
+    }
+
     // Compute Bag of Words vector
     mCurrentFrame.ComputeBoW();
 
@@ -2859,17 +3323,37 @@ bool Tracking::TrackWithMotionModel()
     // Create "visual odometry" points if in Localization Mode
     UpdateLastFrame();
 
-    if (mpAtlas->isImuInitialized() && (mCurrentFrame.mnId>mnLastRelocFrameId+mnFramesToResetIMU))
+    /*
+     * 測試模式：
+     * 關閉 PredictStateIMU，但保留後面的 inertial optimization。
+     */
+    if(kEnableImuPrediction &&
+       mpAtlas->isImuInitialized() &&
+       !mbRelocalizedFromLoadedAtlas &&
+       (mCurrentFrame.mnId >
+        mnLastRelocFrameId + mnFramesToResetIMU))
     {
-        // Predict state with IMU if it is initialized and it doesnt need reset
-        PredictStateIMU();
-        return true;
-    }
-    else
-    {
-        mCurrentFrame.SetPose(mVelocity * mLastFrame.GetPose());
+        if(PredictStateIMU())
+        {
+            return true;
+        }
     }
 
+    if(!kEnableImuPrediction &&
+       mCurrentFrame.mnId % 30 == 0)
+    {
+        std::cout
+            << "[IMU TEST] PredictStateIMU disabled"
+            << " frame=" << mCurrentFrame.mnId
+            << std::endl;
+    }
+
+    /*
+     * 不使用 IMU prediction 時，
+     * 仍使用上一幀的視覺 motion model 提供初始 pose。
+     */
+    mCurrentFrame.SetPose(
+        mVelocity * mLastFrame.GetPose());
 
 
 
@@ -2948,7 +3432,6 @@ bool Tracking::TrackWithMotionModel()
 
 bool Tracking::TrackLocalMap()
 {
-
     // We have an estimation of the camera pose and some map points tracked in the frame.
     // We retrieve the local map and try to find matches to points in the local map.
     mTrackedFr++;
@@ -2966,28 +3449,227 @@ bool Tracking::TrackLocalMap()
                 aux2++;
         }
 
-    int inliers;
-    if (!mpAtlas->isImuInitialized())
+    int inliers = 0;
+
+    if(!kEnableInertialOptimization)
+    {
+        if(mCurrentFrame.mnId % 30 == 0)
+        {
+            std::cout
+                << "[IMU TEST] Inertial optimization disabled"
+                << " frame=" << mCurrentFrame.mnId
+                << std::endl;
+        }
+
         Optimizer::PoseOptimization(&mCurrentFrame);
+    }
+    else if(!mpAtlas->isImuInitialized())
+    {
+        std::cout
+            << "[TLM OPT MODE] visual: map IMU not initialized"
+            << std::endl;
+
+        Optimizer::PoseOptimization(&mCurrentFrame);
+    }
     else
     {
-        if(mCurrentFrame.mnId<=mnLastRelocFrameId+mnFramesToResetIMU)
+        const unsigned long resetThreshold =
+            mnLastRelocFrameId +
+            static_cast<unsigned long>(mnFramesToResetIMU);
+
+        const bool bStandardRelocWarmup =
+            mCurrentFrame.mnId <= resetThreshold;
+
+        if(mCurrentFrame.mnId % 30 == 0)
         {
-            Verbose::PrintMess("TLM: PoseOptimization ", Verbose::VERBOSITY_DEBUG);
+            std::cout
+                << "[TLM OPT MODE]"
+                << " frame=" << mCurrentFrame.mnId
+                << " atlasBootstrap="
+                << mbRelocalizedFromLoadedAtlas
+                << " standardWarmup="
+                << bStandardRelocWarmup
+                << " prevPrior="
+                << (mCurrentFrame.mpPrevFrame
+                        ? mCurrentFrame.mpPrevFrame->mpcpi
+                        : nullptr)
+                << std::endl;
+        }
+
+        /*
+        * 載入 Atlas 後，先維持 visual-only warmup。
+        */
+        if(mbRelocalizedFromLoadedAtlas &&
+        bStandardRelocWarmup)
+        {
+            std::cout
+                << "[TLM OPT MODE] visual-only Atlas warmup"
+                << std::endl;
+
             Optimizer::PoseOptimization(&mCurrentFrame);
         }
-        else
+        /*
+        * warmup 結束後，第一個慣性 frame 必須以 LastKeyFrame
+        * 建立第一個 ConstraintPoseImu prior。
+        */
+        else if(mbRelocalizedFromLoadedAtlas &&
+        !mbAtlasLiveAnchorReady)
         {
-            // if(!mbMapUpdated && mState == OK) //  && (mnMatchesInliers>30))
-            if(!mbMapUpdated) //  && (mnMatchesInliers>30))
+            if(mCurrentFrame.mnId % 30 == 0)
             {
-                Verbose::PrintMess("TLM: PoseInertialOptimizationLastFrame ", Verbose::VERBOSITY_DEBUG);
-                inliers = Optimizer::PoseInertialOptimizationLastFrame(&mCurrentFrame); // , !mpLastKeyFrame->GetMap()->GetIniertialBA1());
+                std::cout
+                    << "[ATLAS TEST] Waiting for live anchor"
+                    << " frame=" << mCurrentFrame.mnId
+                    << std::endl;
+            }
+
+            Optimizer::PoseOptimization(&mCurrentFrame);
+        }
+        else if(mbRelocalizedFromLoadedAtlas &&
+                mbAtlasLiveAnchorReady)
+        {
+            constexpr float kBootstrapMinDt = 0.020f;
+            constexpr float kBootstrapMaxDt = 0.050f;
+
+            const bool bBootstrapPointersValid =
+                mpAtlasLiveAnchorKF &&
+                mpLastKeyFrame == mpAtlasLiveAnchorKF &&
+                mCurrentFrame.mpLastKeyFrame == mpAtlasLiveAnchorKF &&
+                mCurrentFrame.mpImuPreintegrated &&
+                mCurrentFrame.mpImuPreintegratedFrame;
+
+            const float bootstrapDt =
+                mCurrentFrame.mpImuPreintegrated
+                    ? mCurrentFrame.mpImuPreintegrated->dT
+                    : -1.0f;
+
+            const bool bBootstrapDtValid =
+                bootstrapDt >= kBootstrapMinDt &&
+                bootstrapDt <= kBootstrapMaxDt;
+
+            const bool bBootstrapValid =
+                bBootstrapPointersValid &&
+                bBootstrapDtValid;
+
+            if(!bBootstrapValid)
+            {
+                std::cout
+                    << "[ATLAS LIVE BOOTSTRAP] Waiting"
+                    << " frame=" << mCurrentFrame.mnId
+                    << " liveAnchor=" << mpAtlasLiveAnchorKF
+                    << " trackerLastKF=" << mpLastKeyFrame
+                    << " frameLastKF="
+                    << mCurrentFrame.mpLastKeyFrame
+                    << " preintKF="
+                    << mCurrentFrame.mpImuPreintegrated
+                    << " preintFrame="
+                    << mCurrentFrame.mpImuPreintegratedFrame
+                    << " dt=" << bootstrapDt
+                    << " pointersValid="
+                    << bBootstrapPointersValid
+                    << " dtValid="
+                    << bBootstrapDtValid
+                    << std::endl;
+
+                /*
+                * 此 frame 不建立第一個 inertial prior，
+                * 繼續用純視覺最佳化，等下一個正常時間間隔。
+                */
+                Optimizer::PoseOptimization(
+                    &mCurrentFrame);
             }
             else
             {
-                Verbose::PrintMess("TLM: PoseInertialOptimizationLastKeyFrame ", Verbose::VERBOSITY_DEBUG);
-                inliers = Optimizer::PoseInertialOptimizationLastKeyFrame(&mCurrentFrame); // , !mpLastKeyFrame->GetMap()->GetIniertialBA1());
+                std::cout
+                    << "[ATLAS LIVE BOOTSTRAP]"
+                    << " frame=" << mCurrentFrame.mnId
+                    << " liveKF="
+                    << mpAtlasLiveAnchorKF->mnId
+                    << " preintDt="
+                    << bootstrapDt
+                    << std::endl;
+
+                inliers =
+                    Optimizer::
+                    PoseInertialOptimizationLastKeyFrame(
+                        &mCurrentFrame);
+
+                if(mCurrentFrame.mpcpi)
+                {
+                    std::cout
+                        << "[ATLAS LIVE BOOTSTRAP] SUCCESS"
+                        << " frame="
+                        << mCurrentFrame.mnId
+                        << " prior="
+                        << mCurrentFrame.mpcpi
+                        << " inliers="
+                        << inliers
+                        << std::endl;
+
+                    mbRelocalizedFromLoadedAtlas =
+                        false;
+                }
+                else
+                {
+                    std::cerr
+                        << "[ATLAS LIVE BOOTSTRAP] FAILED"
+                        << std::endl;
+
+                    Optimizer::PoseOptimization(
+                        &mCurrentFrame);
+                }
+            }
+        }
+
+        /*
+        * 一般慣性追蹤：只有上一幀真的具有 prior 才用 LastFrame。
+        */
+        else if(!mbMapUpdated &&
+                mCurrentFrame.mpPrevFrame &&
+                mCurrentFrame.mpPrevFrame->mpcpi)
+        {
+            std::cout
+                << "[TLM OPT MODE] inertial last frame"
+                << std::endl;
+
+            inliers =
+                Optimizer::PoseInertialOptimizationLastFrame(
+                    &mCurrentFrame);
+        }
+        /*
+        * map 更新或上一幀 prior 不存在時，以 LastKeyFrame 重建 prior。
+        */
+        else
+        {
+            if(!mCurrentFrame.mpLastKeyFrame ||
+            !mCurrentFrame.mpImuPreintegrated ||
+            !mCurrentFrame.mpImuPreintegratedFrame)
+            {
+                std::cerr
+                    << "[TLM OPT MODE] Cannot use inertial optimizer;"
+                    << " fallback to visual"
+                    << " lastKF=" << mCurrentFrame.mpLastKeyFrame
+                    << " preintKF="
+                    << mCurrentFrame.mpImuPreintegrated
+                    << " preintFrame="
+                    << mCurrentFrame.mpImuPreintegratedFrame
+                    << std::endl;
+
+                Optimizer::PoseOptimization(&mCurrentFrame);
+            }
+            else
+            {
+                std::cout
+                    << "[TLM OPT MODE] inertial last keyframe"
+                    << " reason="
+                    << (mbMapUpdated
+                            ? "map-updated"
+                            : "previous-prior-missing")
+                    << std::endl;
+
+                inliers =
+                    Optimizer::PoseInertialOptimizationLastKeyFrame(
+                        &mCurrentFrame);
             }
         }
     }
@@ -3022,6 +3704,27 @@ bool Tracking::TrackLocalMap()
             else if(mSensor==System::STEREO)
                 mCurrentFrame.mvpMapPoints[i] = static_cast<MapPoint*>(NULL);
         }
+    }
+    if(!mbRelocalizedFromLoadedAtlas && mCurrentFrame.mnId % 3 == 0)
+    {
+        const float gyroNorm =
+            mLatestGyroNorm.load(
+                std::memory_order_relaxed);
+
+        const double imageDt =
+            mCurrentFrame.mTimeStamp -
+            mLastFrame.mTimeStamp;
+
+        std::cout
+            << std::fixed
+            << std::setprecision(9)
+            << "[TRACK DIAG]"
+            << " frame=" << mCurrentFrame.mnId
+            << " t=" << mCurrentFrame.mTimeStamp
+            << " imageDt=" << imageDt
+            << " gyroNorm=" << gyroNorm
+            << " inliers=" << mnMatchesInliers
+            << std::endl;
     }
 
     // Decide if the tracking was succesful
@@ -3071,6 +3774,63 @@ bool Tracking::NeedNewKeyFrame()
             return true;
         else
             return false;
+    }
+
+    /*
+    * Atlas 重定位後必須建立本次 session 的第一個 live KeyFrame。
+    * 等至少約 0.5 秒的視覺追蹤，避免直接在重定位當下建立。
+    */
+    if(mbAtlasWaitingLiveAnchor)
+    {
+        const unsigned long framesSinceReloc =
+            mCurrentFrame.mnId -
+            mnLastRelocFrameId;
+
+        /*
+        * 必須同時滿足：
+        *
+        * 1. 視覺追蹤至少經過 30 幀；
+        * 2. 已收集到穩定的靜止 IMU。
+        */
+        if(framesSinceReloc >=
+            static_cast<unsigned long>(
+                mnFramesToResetIMU) &&
+        mbAtlasStaticImuReady)
+        {
+            std::cout
+                << "[ATLAS LIVE ANCHOR]"
+                << " Request new live KeyFrame"
+                << " frame="
+                << mCurrentFrame.mnId
+                << " framesSinceReloc="
+                << framesSinceReloc
+                << " staticImuReady="
+                << mbAtlasStaticImuReady
+                << " gyroBias=["
+                << mAtlasGyroMean.transpose()
+                << "]"
+                << std::endl;
+
+            return true;
+        }
+
+        if(framesSinceReloc % 30 == 0)
+        {
+            std::cout
+                << "[ATLAS LIVE ANCHOR]"
+                << " Waiting for static IMU"
+                << " frame="
+                << mCurrentFrame.mnId
+                << " framesSinceReloc="
+                << framesSinceReloc
+                << " samples="
+                << mnAtlasStaticImuSamples
+                << " ready="
+                << mbAtlasStaticImuReady
+                << std::endl;
+        }
+
+        return false;
     }
 
     if(mbOnlyTracking)
@@ -3222,26 +3982,193 @@ void Tracking::CreateNewKeyFrame()
         return;
 
     KeyFrame* pKF = new KeyFrame(mCurrentFrame,mpAtlas->GetCurrentMap(),mpKeyFrameDB);
+    const bool bCreatingAtlasLiveAnchor =
+        mbAtlasWaitingLiveAnchor &&
+        !mbAtlasLiveAnchorReady;
 
-    if(mpAtlas->isImuInitialized()) //  || mpLocalMapper->IsInitializing())
+    if(mpAtlas->isImuInitialized())
+    {
+        /*
+        * live anchor 仍需要 velocity / gyro bias / acc bias vertices，
+        * 因此它本身必須是 IMU KeyFrame。
+        *
+        * 它只是沒有跨 session 的 incoming inertial edge。
+        */
         pKF->bImu = true;
+    }
 
     pKF->SetNewBias(mCurrentFrame.mImuBias);
     mpReferenceKF = pKF;
     mCurrentFrame.mpReferenceKF = pKF;
 
-    if(mpLastKeyFrame)
+    if(bCreatingAtlasLiveAnchor)
+    {
+        /*
+        * 不可把舊 Atlas KF 當成本次 session 的 IMU temporal predecessor。
+        *
+        * 視覺參考仍由 mpReferenceKF / covisibility graph 維持，
+        * temporal IMU chain 則從這個 live anchor 重新開始。
+        */
+        pKF->mPrevKF = nullptr;
+        pKF->mNextKF = nullptr;
+
+        std::cout
+            << "[ATLAS LIVE ANCHOR] Temporal chain detached"
+            << " KF=" << pKF->mnId
+            << " oldTrackerLastKF="
+            << (mpLastKeyFrame ? std::to_string(mpLastKeyFrame->mnId)
+                            : std::string("null"))
+            << std::endl;
+    }
+    else if(mpLastKeyFrame)
     {
         pKF->mPrevKF = mpLastKeyFrame;
         mpLastKeyFrame->mNextKF = pKF;
     }
     else
-        Verbose::PrintMess("No last KF in KF creation!!", Verbose::VERBOSITY_NORMAL);
-
-    // Reset preintegration from last KF (Create new object)
-    if (mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD)
     {
-        mpImuPreintegratedFromLastKF = new IMU::Preintegrated(pKF->GetImuBias(),pKF->mImuCalib);
+        Verbose::PrintMess(
+            "No last KF in KF creation!!",
+            Verbose::VERBOSITY_NORMAL);
+    }
+
+    /*
+    * 建立本次程式啟動後的第一個 live KeyFrame。
+    */
+    if(bCreatingAtlasLiveAnchor)
+    {
+        const Eigen::Vector3f zeroVelocity =
+            Eigen::Vector3f::Zero();
+
+        // 本次 session 的初始速度先設為零。
+        pKF->SetVelocity(zeroVelocity);
+        mCurrentFrame.SetVelocity(zeroVelocity);
+        mLastFrame.SetVelocity(zeroVelocity);
+
+        /*
+        * accelerometer bias 暫時沿用 Atlas。
+        *
+        * IMU::Bias 建構子順序是：
+        * Bias(acc_x, acc_y, acc_z,
+        *      gyro_x, gyro_y, gyro_z)
+        */
+        const IMU::Bias atlasSessionBias(
+            mLastBias.bax,
+            mLastBias.bay,
+            mLastBias.baz,
+            mAtlasGyroMean.x(),
+            mAtlasGyroMean.y(),
+            mAtlasGyroMean.z());
+
+        mLastBias = atlasSessionBias;
+
+        pKF->SetNewBias(atlasSessionBias);
+        mCurrentFrame.SetNewBias(atlasSessionBias);
+        mLastFrame.SetNewBias(atlasSessionBias);
+        
+        const Eigen::Vector3f atlasAccBias(
+            mLastBias.bax,
+            mLastBias.bay,
+            mLastBias.baz);
+
+        const Eigen::Vector3f accMeanUnbiased =
+            mAtlasAccMean - atlasAccBias;
+
+        std::cout
+            << "[ATLAS GRAVITY DIAGNOSTIC]"
+            << " rawAccMean=["
+            << mAtlasAccMean.transpose()
+            << "]"
+            << " atlasAccBias=["
+            << atlasAccBias.transpose()
+            << "]"
+            << " unbiasedAcc=["
+            << accMeanUnbiased.transpose()
+            << "]"
+            << " unbiasedNorm="
+            << accMeanUnbiased.norm()
+            << std::endl;
+
+        std::cout
+            << "[ATLAS STATIC IMU]"
+            << " Apply session bias"
+            << " accelBias=["
+            << atlasSessionBias.bax << " "
+            << atlasSessionBias.bay << " "
+            << atlasSessionBias.baz << "]"
+            << " gyroBias=["
+            << atlasSessionBias.bwx << " "
+            << atlasSessionBias.bwy << " "
+            << atlasSessionBias.bwz << "]"
+            << std::endl;
+
+        /*
+        * live anchor 沒有 incoming IMU edge，
+        * 但本身仍具有 IMU state vertices。
+        */
+        pKF->mpImuPreintegrated = nullptr;
+        pKF->bImu = true;
+
+        mpAtlasLiveAnchorKF = pKF;
+        mbAtlasLiveAnchorReady = true;
+        mbAtlasWaitingLiveAnchor = false;
+
+        /*
+        * 不在這裡 delete 舊的 preintegrator。
+        *
+        * mCurrentFrame、mLastFrame 或其他 Frame copy 可能仍持有
+        * 舊 mpImuPreintegratedFromLastKF 的非 owning pointer。
+        * 立即 delete 會造成 use-after-free，進一步破壞 heap。
+        *
+        * Atlas 每次載入只會進入一次 live-anchor 流程，
+        * 暫時保留這一個舊物件，比產生 dangling pointer 安全。
+        */
+        IMU::Preintegrated* pOldPreintegrated =
+            mpImuPreintegratedFromLastKF;
+
+        mpImuPreintegratedFromLastKF =
+            new IMU::Preintegrated(
+                atlasSessionBias,
+                pKF->mImuCalib);
+
+        /*
+        * current frame 從現在開始必須指向新的、
+        * 以 live anchor 為起點的 KF-to-frame preintegrator。
+        */
+        mCurrentFrame.mpImuPreintegrated =
+            mpImuPreintegratedFromLastKF;
+
+        std::cout
+            << "[ATLAS LIVE ANCHOR] CREATED"
+            << " KF=" << pKF->mnId
+            << " frame=" << mCurrentFrame.mnId
+            << " prevKF=null"
+            << " bImu=" << pKF->bImu
+            << " incomingPreint=" << pKF->mpImuPreintegrated
+            << " oldTrackerPreint=" << pOldPreintegrated
+            << " newTrackerPreint="
+            << mpImuPreintegratedFromLastKF
+            << " framePreint="
+            << mCurrentFrame.mpImuPreintegrated
+            << " velocity=["
+            << pKF->GetVelocity().transpose()
+            << "]"
+            << std::endl;
+    }
+    else
+    {
+        /*
+        * 一般 KeyFrame 的原始流程。
+        */
+        if(mSensor == System::IMU_MONOCULAR ||
+        mSensor == System::IMU_STEREO ||
+        mSensor == System::IMU_RGBD)
+        {
+            mpImuPreintegratedFromLastKF =
+                new IMU::Preintegrated(
+                    pKF->GetImuBias(),
+                    pKF->mImuCalib);
+        }
     }
 
     if(mSensor!=System::MONOCULAR && mSensor != System::IMU_MONOCULAR) // TODO check if incluide imu_stereo
@@ -3664,6 +4591,10 @@ bool Tracking::Relocalization()
     // Alternatively perform some iterations of P4P RANSAC
     // Until we found a camera pose supported by enough inliers
     bool bMatch = false;
+
+    // 記錄真正通過 PnP 與幾何驗證的 KeyFrame
+    KeyFrame* pRelocKF = nullptr;
+
     ORBmatcher matcher2(0.9,true);
 
     while(nCandidates>0 && !bMatch)
@@ -3754,9 +4685,10 @@ bool Tracking::Relocalization()
 
 
                 // If the pose is supported by enough inliers stop ransacs and continue
-                if(nGood>=50)
+                if(nGood >= 50)
                 {
                     bMatch = true;
+                    pRelocKF = vpCandidateKFs[i];
                     break;
                 }
             }
@@ -3769,8 +4701,97 @@ bool Tracking::Relocalization()
     }
     else
     {
-        mnLastRelocFrameId = mCurrentFrame.mnId;
-        cout << "Relocalized!!" << endl;
+        if(!pRelocKF)
+        {
+            std::cerr
+                << "[RELOCALIZATION] Match succeeded but reference KF is null"
+                << std::endl;
+            return false;
+        }
+
+        if(pRelocKF->isBad())
+        {
+            std::cerr
+                << "[RELOCALIZATION] Selected reference KF is bad"
+                << std::endl;
+            return false;
+        }
+
+        if(pRelocKF->GetMap() != mpAtlas->GetCurrentMap())
+        {
+            std::cerr
+                << "[RELOCALIZATION] Selected reference KF belongs to wrong map"
+                << std::endl;
+            return false;
+        }
+
+        mpReferenceKF = pRelocKF;
+        mCurrentFrame.mpReferenceKF = pRelocKF;
+
+
+        if(mbAtlasLoaded)
+        {
+            mpLastKeyFrame = pRelocKF;
+            mCurrentFrame.mpLastKeyFrame = pRelocKF;
+
+            mbAtlasWaitingLiveAnchor = true;
+            mbAtlasLiveAnchorReady = false;
+            mpAtlasLiveAnchorKF = nullptr;
+
+            mbAtlasCollectingStaticImu = true;
+            mbAtlasStaticImuReady = false;
+
+            mnAtlasStaticImuSamples = 0;
+            mAtlasStaticImuStartTime = -1.0;
+            mAtlasStaticImuLastTime = -1.0;
+
+            mAtlasGyroSum.setZero();
+            mAtlasGyroSqSum.setZero();
+            mAtlasAccSum.setZero();
+            mAtlasAccSqSum.setZero();
+
+            mAtlasGyroMean.setZero();
+            mAtlasGyroStd.setZero();
+            mAtlasAccMean.setZero();
+            mAtlasAccStd.setZero();
+
+            std::cout
+                << "[ATLAS STATIC IMU] Start collection"
+                << " frame=" << mCurrentFrame.mnId
+                << std::endl;
+
+            mCurrentFrame.SetNewBias(
+                pRelocKF->GetImuBias());
+
+            mLastBias =
+                pRelocKF->GetImuBias();
+
+            IMU::Preintegrated* pOldPreintegrated =
+                mpImuPreintegratedFromLastKF;
+
+            mpImuPreintegratedFromLastKF =
+                new IMU::Preintegrated(
+                    pRelocKF->GetImuBias(),
+                    *mpImuCalib);
+
+            mCurrentFrame.mpImuPreintegrated =
+                mpImuPreintegratedFromLastKF;
+
+            std::cout
+                << "[ATLAS RELOCALIZATION] Reset preintegrator"
+                << " old=" << pOldPreintegrated
+                << " new=" << mpImuPreintegratedFromLastKF
+                << std::endl;
+        }
+            
+
+        std::cout
+            << "Relocalized!!"
+            << " referenceKF=" << pRelocKF->mnId
+            << " map=" << pRelocKF->GetMap()->GetId()
+            << std::endl;
+
+
         return true;
     }
 

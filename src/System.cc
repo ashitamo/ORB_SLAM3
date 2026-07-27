@@ -161,14 +161,54 @@ System::System(const string &strVocFile, const string &strSettingsFile, const eS
             cout << "Error to load the file, please try with other session file or vocabulary file" << endl;
             exit(-1);
         }
+
+        const vector<Map*> loadedMaps =
+            mpAtlas->GetAllMaps();
+
+        cout
+            << "[LOAD ATLAS] maps="
+            << loadedMaps.size()
+            << endl;
+
+        for(Map* pMap : loadedMaps)
+        {
+            if(!pMap)
+            {
+                cout << "[LOAD ATLAS] null map" << endl;
+                continue;
+            }
+
+            cout
+                << "[LOAD ATLAS] map="
+                << pMap->GetId()
+                << " KFs="
+                << pMap->KeyFramesInMap()
+                << " MPs="
+                << pMap->MapPointsInMap()
+                << endl;
+        }
         //mpKeyFrameDatabase = new KeyFrameDatabase(*mpVocabulary);
 
 
         //cout << "KF in DB: " << mpKeyFrameDatabase->mnNumKFs << "; words: " << mpKeyFrameDatabase->mnNumWords << endl;
 
         loadedAtlas = true;
+        // 不要在 localization 模式建立新地圖
+        // mpAtlas->CreateNewMap();
 
-        mpAtlas->CreateNewMap();
+        std::vector<Map*> maps = mpAtlas->GetAllMaps();
+
+        if(!maps.empty())
+        {
+            Map* pLoadedMap = maps.front();
+            mpAtlas->ChangeMap(pLoadedMap);
+
+            std::cout
+                << "[LOAD ATLAS] Using loaded map "
+                << pLoadedMap->GetId()
+                << " as current map"
+                << std::endl;
+        }
 
         //clock_t timeElapsed = clock() - start;
         //unsigned msElapsed = timeElapsed / (CLOCKS_PER_SEC / 1000);
@@ -190,6 +230,15 @@ System::System(const string &strVocFile, const string &strSettingsFile, const eS
     cout << "Seq. Name: " << strSequence << endl;
     mpTracker = new Tracking(this, mpVocabulary, mpFrameDrawer, mpMapDrawer,
                              mpAtlas, mpKeyFrameDatabase, strSettingsFile, mSensor, settings_, strSequence);
+
+    if(loadedAtlas)
+    {
+        mpTracker->SetAtlasLoaded(true);
+
+        std::cout
+            << "[SYSTEM] SetAtlasLoaded(true)"
+            << std::endl;
+    }
 
     //Initialize the Local Mapping thread and launch
     mpLocalMapper = new LocalMapping(this, mpAtlas, mSensor==MONOCULAR || mSensor==IMU_MONOCULAR,
@@ -521,44 +570,101 @@ void System::Shutdown()
 
     cout << "Shutdown" << endl;
 
-    mpLocalMapper->RequestFinish();
-    mpLoopCloser->RequestFinish();
-    /*if(mpViewer)
+    if(mpLocalMapper)
     {
-        mpViewer->RequestFinish();
-        while(!mpViewer->isFinished())
-            usleep(5000);
-    }*/
+        cout << "[SHUTDOWN] Requesting LocalMapping finish" << endl;
+        mpLocalMapper->RequestFinish();
+    }
 
-    // Wait until all thread have effectively stopped
-    /*while(!mpLocalMapper->isFinished() || !mpLoopCloser->isFinished() || mpLoopCloser->isRunningGBA())
+    if(mpLoopCloser)
     {
-        if(!mpLocalMapper->isFinished())
-            cout << "mpLocalMapper is not finished" << endl;*/
-        /*if(!mpLoopCloser->isFinished())
-            cout << "mpLoopCloser is not finished" << endl;
-        if(mpLoopCloser->isRunningGBA()){
-            cout << "mpLoopCloser is running GBA" << endl;
-            cout << "break anyway..." << endl;
+        cout << "[SHUTDOWN] Requesting LoopClosing finish" << endl;
+        mpLoopCloser->RequestFinish();
+    }
+
+    if(mpViewer)
+    {
+        cout << "[SHUTDOWN] Requesting Viewer finish" << endl;
+        mpViewer->RequestFinish();
+    }
+
+    cout << "[SHUTDOWN] Waiting for background threads" << endl;
+
+    while(true)
+    {
+        const bool localMapperFinished =
+            !mpLocalMapper ||
+            mpLocalMapper->isFinished();
+
+        const bool loopCloserFinished =
+            !mpLoopCloser ||
+            mpLoopCloser->isFinished();
+
+        const bool gbaRunning =
+            mpLoopCloser &&
+            mpLoopCloser->isRunningGBA();
+
+        const bool viewerFinished =
+            !mpViewer ||
+            mpViewer->isFinished();
+
+        if(localMapperFinished &&
+           loopCloserFinished &&
+           !gbaRunning &&
+           viewerFinished)
+        {
             break;
-        }*/
-        /*usleep(5000);
-    }*/
+        }
+
+        usleep(5000);
+    }
+
+    cout << "[SHUTDOWN] Background threads stopped" << endl;
+
+    if(mptLocalMapping &&
+       mptLocalMapping->joinable())
+    {
+        cout << "[SHUTDOWN] Joining LocalMapping thread" << endl;
+        mptLocalMapping->join();
+    }
+
+    if(mptLoopClosing &&
+       mptLoopClosing->joinable())
+    {
+        cout << "[SHUTDOWN] Joining LoopClosing thread" << endl;
+        mptLoopClosing->join();
+    }
+
+    if(mptViewer &&
+       mptViewer->joinable())
+    {
+        cout << "[SHUTDOWN] Joining Viewer thread" << endl;
+        mptViewer->join();
+    }
+
+    cout << "[SHUTDOWN] All threads joined" << endl;
 
     if(!mStrSaveAtlasToFile.empty())
     {
-        Verbose::PrintMess("Atlas saving to file " + mStrSaveAtlasToFile, Verbose::VERBOSITY_NORMAL);
+        cout
+            << "[SHUTDOWN] Saving Atlas to "
+            << mStrSaveAtlasToFile
+            << ".osa"
+            << endl;
+
         SaveAtlas(FileType::BINARY_FILE);
+
+        cout << "[SHUTDOWN] Atlas saved" << endl;
     }
 
-    /*if(mpViewer)
-        pangolin::BindToContext("ORB-SLAM2: Map Viewer");*/
-
 #ifdef REGISTER_TIMES
-    mpTracker->PrintTimeStats();
+    if(mpTracker)
+    {
+        mpTracker->PrintTimeStats();
+    }
 #endif
 
-
+    cout << "[SHUTDOWN] Complete" << endl;
 }
 
 bool System::isShutDown() {
@@ -1400,13 +1506,60 @@ void System::InsertTrackTime(double& time)
 }
 #endif
 
-void System::SaveAtlas(int type){
+void System::SaveAtlas(int type)
+{
     if(!mStrSaveAtlasToFile.empty())
     {
-        //clock_t start = clock();
+        auto printAtlasStats =
+            [this](const std::string& stage)
+            {
+                const std::vector<Map*> maps =
+                    mpAtlas->GetAllMaps();
 
-        // Save the current session
+                std::cout
+                    << "[SAVE ATLAS][" << stage << "] maps="
+                    << maps.size()
+                    << std::endl;
+
+                for(Map* pMap : maps)
+                {
+                    if(!pMap)
+                    {
+                        std::cout
+                            << "[SAVE ATLAS][" << stage
+                            << "] null map"
+                            << std::endl;
+                        continue;
+                    }
+
+                    std::cout
+                        << "[SAVE ATLAS][" << stage << "] map="
+                        << pMap->GetId()
+                        << " KFs="
+                        << pMap->KeyFramesInMap()
+                        << " MPs="
+                        << pMap->MapPointsInMap()
+                        << " bad="
+                        << pMap->IsBad()
+                        << std::endl;
+                }
+            };
+
+        printAtlasStats("BEFORE PRESAVE");
+
+        std::cout
+            << "[SAVE ATLAS] Calling Atlas::PreSave()"
+            << std::endl;
+
         mpAtlas->PreSave();
+
+        std::cout
+            << "[SAVE ATLAS] Atlas::PreSave() completed"
+            << std::endl;
+
+        printAtlasStats("AFTER PRESAVE");
+
+        // 以下保留原本寫檔程式
 
         string pathSaveFileName = "./";
         pathSaveFileName = pathSaveFileName.append(mStrSaveAtlasToFile);

@@ -126,18 +126,71 @@ void LocalMapping::Run()
                 if(mpAtlas->KeyFramesInMap()>2)
                 {
 
-                    if(mbInertial && mpCurrentKeyFrame->GetMap()->isImuInitialized())
-                    {
-                        float dist = (mpCurrentKeyFrame->mPrevKF->GetCameraCenter() - mpCurrentKeyFrame->GetCameraCenter()).norm() +
-                                (mpCurrentKeyFrame->mPrevKF->mPrevKF->GetCameraCenter() - mpCurrentKeyFrame->mPrevKF->GetCameraCenter()).norm();
+                    const bool bMapImuInitialized =
+                        mbInertial &&
+                        mpCurrentKeyFrame->GetMap()->isImuInitialized();
 
-                        if(dist>0.05)
-                            mTinit += mpCurrentKeyFrame->mTimeStamp - mpCurrentKeyFrame->mPrevKF->mTimeStamp;
+                    const bool bValidTemporalChain =
+                        mpCurrentKeyFrame->bImu &&
+                        mpCurrentKeyFrame->mPrevKF &&
+                        mpCurrentKeyFrame->mPrevKF->bImu &&
+                        mpCurrentKeyFrame->mPrevKF->mPrevKF &&
+                        mpCurrentKeyFrame->mpImuPreintegrated;
+
+                    if(bMapImuInitialized && bValidTemporalChain)
+                    {
+                        const float dist =
+                            (mpCurrentKeyFrame->mPrevKF->GetCameraCenter()
+                            - mpCurrentKeyFrame->GetCameraCenter()).norm()
+                            +
+                            (mpCurrentKeyFrame->mPrevKF->mPrevKF->GetCameraCenter()
+                            - mpCurrentKeyFrame->mPrevKF->GetCameraCenter()).norm();
+
+                        const Eigen::Vector3f velocity =
+                            mpCurrentKeyFrame->GetVelocity();
+
+                        const Eigen::Vector3f gyroBias =
+                            mpCurrentKeyFrame->GetGyroBias();
+
+                        const Eigen::Vector3f accBias =
+                            mpCurrentKeyFrame->GetAccBias();
+
+                        cout << std::fixed << std::setprecision(9)
+                            << "[IMU STATE]"
+                            << " t=" << mpCurrentKeyFrame->mTimeStamp
+                            << " dist=" << dist
+                            << " vel=[" << velocity.transpose() << "]"
+                            << " bg=[" << gyroBias.transpose() << "]"
+                            << " ba=[" << accBias.transpose() << "]"
+                            << " mTinit=" << mTinit
+                            << endl;
+
+                        const double dtKF =
+                            mpCurrentKeyFrame->mTimeStamp -
+                            mpCurrentKeyFrame->mPrevKF->mTimeStamp;
+
+                        if(dtKF > 0.0 && dtKF < 1.0 && dist > 0.05f)
+                        {
+                            mTinit += static_cast<float>(dtKF);
+                        }
+                        else if(dtKF <= 0.0 || dtKF >= 1.0)
+                        {
+                            cout
+                                << "[LOCAL MAPPING] Skip invalid temporal dt"
+                                << " currentKF=" << mpCurrentKeyFrame->mnId
+                                << " prevKF=" << mpCurrentKeyFrame->mPrevKF->mnId
+                                << " dt=" << dtKF
+                                << endl;
+                        }
+
                         if(!mpCurrentKeyFrame->GetMap()->GetIniertialBA2())
                         {
-                            if((mTinit<10.f) && (dist<0.02))
+                            if((mTinit < 10.f) && (dist < 0.02f))
                             {
-                                cout << "Not enough motion for initializing. Reseting..." << endl;
+                                cout
+                                    << "Not enough motion for initializing. Reseting..."
+                                    << endl;
+
                                 unique_lock<mutex> lock(mMutexReset);
                                 mbResetRequestedActiveMap = true;
                                 mpMapToReset = mpCurrentKeyFrame->GetMap();
@@ -145,13 +198,56 @@ void LocalMapping::Run()
                             }
                         }
 
-                        bool bLarge = ((mpTracker->GetMatchesInliers()>75)&&mbMonocular)||((mpTracker->GetMatchesInliers()>100)&&!mbMonocular);
-                        Optimizer::LocalInertialBA(mpCurrentKeyFrame, &mbAbortBA, mpCurrentKeyFrame->GetMap(),num_FixedKF_BA,num_OptKF_BA,num_MPs_BA,num_edges_BA, bLarge, !mpCurrentKeyFrame->GetMap()->GetIniertialBA2());
+                        bool bLarge =
+                            ((mpTracker->GetMatchesInliers() > 75) && mbMonocular) ||
+                            ((mpTracker->GetMatchesInliers() > 100) && !mbMonocular);
+
+                        Optimizer::LocalInertialBA(
+                            mpCurrentKeyFrame,
+                            &mbAbortBA,
+                            mpCurrentKeyFrame->GetMap(),
+                            num_FixedKF_BA,
+                            num_OptKF_BA,
+                            num_MPs_BA,
+                            num_edges_BA,
+                            bLarge,
+                            !mpCurrentKeyFrame->GetMap()->GetIniertialBA2());
+
                         b_doneLBA = true;
                     }
                     else
                     {
-                        Optimizer::LocalBundleAdjustment(mpCurrentKeyFrame,&mbAbortBA, mpCurrentKeyFrame->GetMap(),num_FixedKF_BA,num_OptKF_BA,num_MPs_BA,num_edges_BA);
+                        /*
+                        * live anchor 及 anchor 後第一個 KF 尚未形成至少兩段
+                        * 本次 session 的 temporal chain，先做純視覺 LBA。
+                        */
+                        if(bMapImuInitialized)
+                        {
+                            cout
+                                << "[LOCAL MAPPING] Visual BA while building live IMU chain"
+                                << " KF=" << mpCurrentKeyFrame->mnId
+                                << " prev="
+                                << (mpCurrentKeyFrame->mPrevKF
+                                        ? std::to_string(mpCurrentKeyFrame->mPrevKF->mnId)
+                                        : std::string("null"))
+                                << " prevPrev="
+                                << (mpCurrentKeyFrame->mPrevKF &&
+                                    mpCurrentKeyFrame->mPrevKF->mPrevKF
+                                        ? std::to_string(
+                                            mpCurrentKeyFrame->mPrevKF->mPrevKF->mnId)
+                                        : std::string("null"))
+                                << std::endl;
+                        }
+
+                        Optimizer::LocalBundleAdjustment(
+                            mpCurrentKeyFrame,
+                            &mbAbortBA,
+                            mpCurrentKeyFrame->GetMap(),
+                            num_FixedKF_BA,
+                            num_OptKF_BA,
+                            num_MPs_BA,
+                            num_edges_BA);
+
                         b_doneLBA = true;
                     }
 

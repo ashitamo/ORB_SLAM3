@@ -19,6 +19,7 @@
 #include "MapPoint.h"
 #include "ORBmatcher.h"
 
+#include <limits>
 #include<mutex>
 
 namespace ORB_SLAM3
@@ -569,62 +570,138 @@ void MapPoint::UpdateMap(Map* pMap)
     mpMap = pMap;
 }
 
-void MapPoint::PreSave(set<KeyFrame*>& spKF,set<MapPoint*>& spMP)
+void MapPoint::PreSave(
+    set<KeyFrame*>& spKF,
+    set<MapPoint*>& spMP)
 {
+    unique_lock<mutex> lockFeatures(
+        mMutexFeatures);
+
     mBackupReplacedId = -1;
-    if(mpReplaced && spMP.find(mpReplaced) != spMP.end())
-        mBackupReplacedId = mpReplaced->mnId;
+
+    if(mpReplaced &&
+       spMP.find(mpReplaced) != spMP.end())
+    {
+        mBackupReplacedId =
+            mpReplaced->mnId;
+    }
 
     mBackupObservationsId1.clear();
     mBackupObservationsId2.clear();
-    // Save the id and position in each KF who view it
-    for(std::map<KeyFrame*,std::tuple<int,int> >::const_iterator it = mObservations.begin(), end = mObservations.end(); it != end; ++it)
+
+    /*
+     * 只備份仍屬於目前 Map 的有效 KeyFrame observation。
+     * 不在 PreSave 中修改 mObservations。
+     */
+    for(const auto& observation :
+        mObservations)
     {
-        KeyFrame* pKFi = it->first;
-        if(spKF.find(pKFi) != spKF.end())
+        KeyFrame* pKFi =
+            observation.first;
+
+        if(pKFi == nullptr)
         {
-            mBackupObservationsId1[it->first->mnId] = get<0>(it->second);
-            mBackupObservationsId2[it->first->mnId] = get<1>(it->second);
+            continue;
         }
-        else
+
+        if(spKF.find(pKFi) ==
+           spKF.end())
         {
-            EraseObservation(pKFi);
+            continue;
         }
+
+        mBackupObservationsId1[pKFi->mnId] =
+            get<0>(observation.second);
+
+        mBackupObservationsId2[pKFi->mnId] =
+            get<1>(observation.second);
     }
 
-    // Save the id of the reference KF
-    if(spKF.find(mpRefKF) != spKF.end())
+
+    mBackupRefKFId =
+        std::numeric_limits<unsigned long>::max();
+
+    if(mpRefKF &&
+       spKF.find(mpRefKF) !=
+       spKF.end())
     {
-        mBackupRefKFId = mpRefKF->mnId;
+        mBackupRefKFId =
+            mpRefKF->mnId;
     }
 }
 
-void MapPoint::PostLoad(map<long unsigned int, KeyFrame*>& mpKFid, map<long unsigned int, MapPoint*>& mpMPid)
+void MapPoint::PostLoad(
+    map<long unsigned int, KeyFrame*>& mpKFid,
+    map<long unsigned int, MapPoint*>& mpMPid)
 {
-    mpRefKF = mpKFid[mBackupRefKFId];
-    if(!mpRefKF)
+    mpRefKF = nullptr;
+
+    const unsigned long invalidId =
+        std::numeric_limits<unsigned long>::max();
+
+    if(mBackupRefKFId != invalidId)
     {
-        cout << "ERROR: MP without KF reference " << mBackupRefKFId << "; Num obs: " << nObs << endl;
+        auto itRef = mpKFid.find(mBackupRefKFId);
+
+        if(itRef != mpKFid.end())
+        {
+            mpRefKF = itRef->second;
+        }
     }
-    mpReplaced = static_cast<MapPoint*>(NULL);
-    if(mBackupReplacedId>=0)
+
+    mpReplaced = nullptr;
+
+    if(mBackupReplacedId >= 0)
     {
-        map<long unsigned int, MapPoint*>::iterator it = mpMPid.find(mBackupReplacedId);
-        if (it != mpMPid.end())
-            mpReplaced = it->second;
+        auto itMP = mpMPid.find(mBackupReplacedId);
+
+        if(itMP != mpMPid.end())
+        {
+            mpReplaced = itMP->second;
+        }
     }
 
     mObservations.clear();
 
-    for(map<long unsigned int, int>::const_iterator it = mBackupObservationsId1.begin(), end = mBackupObservationsId1.end(); it != end; ++it)
+    for(auto it = mBackupObservationsId1.begin();
+        it != mBackupObservationsId1.end();
+        ++it)
     {
-        KeyFrame* pKFi = mpKFid[it->first];
-        map<long unsigned int, int>::const_iterator it2 = mBackupObservationsId2.find(it->first);
-        std::tuple<int, int> indexes = tuple<int,int>(it->second,it2->second);
-        if(pKFi)
+        auto itKF = mpKFid.find(it->first);
+        auto itRight =
+            mBackupObservationsId2.find(it->first);
+
+        if(itKF == mpKFid.end() ||
+           itRight == mBackupObservationsId2.end())
         {
-           mObservations[pKFi] = indexes;
+            continue;
         }
+
+        KeyFrame* pKFi = itKF->second;
+
+        if(!pKFi)
+        {
+            continue;
+        }
+
+        mObservations[pKFi] =
+            std::make_tuple(
+                it->second,
+                itRight->second);
+
+        if(mpRefKF == nullptr)
+        {
+            mpRefKF = pKFi;
+        }
+    }
+
+    if(mpRefKF == nullptr)
+    {
+        cout << "WARNING: MP " << mnId
+             << " has no valid reference KF"
+             << "; observations="
+             << mObservations.size()
+             << endl;
     }
 
     mBackupObservationsId1.clear();

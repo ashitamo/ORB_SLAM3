@@ -1,0 +1,98 @@
+%YAML:1.0
+
+#--------------------------------------------------------------------------------------------
+# Camera Parameters
+# 目前使用 RealSense 已校正的 image_rect_raw
+#--------------------------------------------------------------------------------------------
+
+File.version: "1.0"
+
+Camera.type: "PinHole"
+
+# Left camera
+Camera1.fx: 427.6786193847656
+Camera1.fy: 427.6786193847656
+Camera1.cx: 426.2860107421875
+Camera1.cy: 240.9849090576172
+
+Camera1.k1: 0.0
+Camera1.k2: 0.0
+Camera1.p1: 0.0
+Camera1.p2: 0.0
+
+# Right camera
+Camera2.fx: 427.6786193847656
+Camera2.fy: 427.6786193847656
+Camera2.cx: 426.2860107421875
+Camera2.cy: 240.9849090576172
+
+Camera2.k1: 0.0
+Camera2.k2: 0.0
+Camera2.p1: 0.0
+Camera2.p2: 0.0
+
+# Transform from left camera to right camera.
+# baseline = 7.687267780303955 / 427.6786193847656
+#          = 0.0179744 m
+Stereo.T_c1_c2: !!opencv-matrix
+   rows: 4
+   cols: 4
+   dt: f
+   data: [1.0, 0.0, 0.0, -0.0179744,
+          0.0, 1.0, 0.0,  0.0,
+          0.0, 0.0, 1.0,  0.0,
+          0.0, 0.0, 0.0,  1.0]
+
+Camera.width: 848
+Camera.height: 480
+Camera.fps: 30
+
+# 0: grayscale/BGR, 1: RGB
+Camera.RGB: 0
+
+# Close/far point threshold used by ORB-SLAM3
+Stereo.ThDepth: 35.0
+
+#--------------------------------------------------------------------------------------------
+# ORB Parameters
+#--------------------------------------------------------------------------------------------
+
+ORBextractor.nFeatures: 1500
+ORBextractor.scaleFactor: 1.2
+ORBextractor.nLevels: 8
+ORBextractor.iniThFAST: 20
+ORBextractor.minThFAST: 7
+
+#--------------------------------------------------------------------------------------------
+# Viewer Parameters
+#--------------------------------------------------------------------------------------------
+
+Viewer.KeyFrameSize: 0.05
+Viewer.KeyFrameLineWidth: 1.0
+Viewer.GraphLineWidth: 0.9
+Viewer.PointSize: 2.0
+Viewer.CameraSize: 0.08
+Viewer.CameraLineWidth: 3.0
+Viewer.ViewpointX: 0.0
+Viewer.ViewpointY: -0.7
+Viewer.ViewpointZ: -1.8
+Viewer.ViewpointF: 500.0
+Viewer.imageViewScale: 1.0
+
+# Transformation from left camera frame to IMU/body frame
+# This is inverse(T_cam_imu) from Kalibr.
+IMU.T_b_c1: !!opencv-matrix
+   rows: 4
+   cols: 4
+   dt: f
+   data: [ 0.013246093499588, -0.176450775747820,  0.984220333434030,  0.013252775424136,
+     -0.999883941202309, -0.009746255920432,  0.011709595265010,  0.004325550794987,
+      0.007526296083537, -0.984261212399192, -0.176559396900128,  0.037529161442451,
+      0.0,                0.0,                0.0,                1.0 ]
+   
+# IMU noise parameters
+IMU.NoiseGyro: 0.000818996
+IMU.NoiseAcc: 0.002856425
+IMU.GyroWalk: 0.000005252737902735109
+IMU.AccWalk: 0.000021912815561319924
+IMU.Frequency: 100.0
