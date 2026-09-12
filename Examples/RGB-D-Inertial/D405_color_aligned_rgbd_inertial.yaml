@@ -1,0 +1,88 @@
+%YAML:1.0
+
+Camera.type: "PinHole"
+
+Camera.fx: 435.0512390136719
+Camera.fy: 434.4240417480469
+Camera.cx: 421.94140625
+Camera.cy: 241.1458740234375
+
+Camera.k1: 0.0
+Camera.k2: 0.0
+Camera.p1: 0.0
+Camera.p2: 0.0
+Camera.k3: 0.0
+
+Camera.width: 848
+Camera.height: 480
+Camera.fps: 30.0
+Camera.RGB: 1
+
+#--------------------------------------------------------------------------------------------
+# RGB-D Parameters
+#--------------------------------------------------------------------------------------------
+
+# bf = color camera fx × depth stereo baseline
+# 435.0512390136719 × 0.017974402815278505
+Camera.bf: 7.819793
+
+# Close/Far depth threshold
+ThDepth: 40.0
+
+# 16UC1，原始深度單位為 mm
+DepthMapFactor: 1000.0
+#--------------------------------------------------------------------------------------------
+# IMU Parameters
+#--------------------------------------------------------------------------------------------
+
+# 已直接沿用驗證成功的 D405 stereo-inertial 外參。
+# 不要再次取 inverse。
+Tbc: !!opencv-matrix
+   rows: 4
+   cols: 4
+   dt: f
+   data: [ 0.006333306554571, -0.175306490420283,  0.984493511673736,  0.013175800138757,
+          -0.999948772382872, -0.008883513733479,  0.004850863963954,  0.004301957451543,
+           0.007895373580837, -0.984473851577015, -0.175353763575885,  0.037614465139379,
+           0.0,                0.0,                0.0,                1.0 ]
+
+IMU.NoiseGyro: 0.000818996
+IMU.NoiseAcc: 0.002856425
+IMU.GyroWalk: 0.000005252737902735109
+IMU.AccWalk: 0.000021912815561319924
+IMU.Frequency: 100
+
+#--------------------------------------------------------------------------------------------
+# ORB Parameters
+#--------------------------------------------------------------------------------------------
+
+ORBextractor.nFeatures: 1500
+ORBextractor.scaleFactor: 1.2
+ORBextractor.nLevels: 8
+
+ORBextractor.iniThFAST: 20
+ORBextractor.minThFAST: 7
+
+#--------------------------------------------------------------------------------------------
+# Viewer Parameters
+#--------------------------------------------------------------------------------------------
+
+Viewer.KeyFrameSize: 0.05
+Viewer.KeyFrameLineWidth: 1.0
+Viewer.GraphLineWidth: 0.9
+Viewer.PointSize: 2.0
+Viewer.CameraSize: 0.08
+Viewer.CameraLineWidth: 3.0
+
+Viewer.ViewpointX: 0.0
+Viewer.ViewpointY: -0.7
+Viewer.ViewpointZ: -1.8
+Viewer.ViewpointF: 500.0
+
+#--------------------------------------------------------------------------------------------
+# Atlas save/load
+#--------------------------------------------------------------------------------------------
+
+# System.LoadAtlasFromFile: "D405_color_rgbd_imu_atlas"
+System.SaveAtlasToFile: "D405_color_rgbd_imu_atlas"
+
