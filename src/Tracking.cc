@@ -4733,7 +4733,13 @@ bool Tracking::Relocalization()
         {
             mpLastKeyFrame = pRelocKF;
             mCurrentFrame.mpLastKeyFrame = pRelocKF;
+        }
 
+        if(mbAtlasLoaded &&
+           (mSensor == System::IMU_MONOCULAR ||
+            mSensor == System::IMU_STEREO ||
+            mSensor == System::IMU_RGBD))
+        {
             mbAtlasWaitingLiveAnchor = true;
             mbAtlasLiveAnchorReady = false;
             mpAtlasLiveAnchorKF = nullptr;
